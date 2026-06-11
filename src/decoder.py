@@ -4,7 +4,7 @@ from typing import List, Dict, Any
 from pathlib import Path
 
 # Assuming llm_sdk is in your path/virtual env as per your tree
-from llm_sdk.llm_sdk import Small_LLM_Model
+from llm_sdk import Small_LLM_Model
 from src.models import FunctionDefinition
 from src.parser import JSONState, IncrementalParser
 
