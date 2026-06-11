@@ -8,7 +8,7 @@ from src.models import FunctionDefinition, TestPrompt
 from src.decoder import ConstrainedDecoder
 
 # Import the provided LLM SDK
-from llm_sdk.llm_sdk import Small_LLM_Model
+from llm_sdk import Small_LLM_Model
 
 
 def parse_args() -> argparse.Namespace:
