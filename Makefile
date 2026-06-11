@@ -6,8 +6,8 @@ PYTHON = uv run python
 FLAKE8 = uv run flake8
 MYPY = uv run mypy
 
-export UV_CACHE_DIR=/sgoinfre/students/lfleitas/uv_cache
-export UV_PROJECT_ENVIRONMENT=/sgoinfre/students/lfleitas/call_me_maybe_venv
+# export UV_CACHE_DIR=/sgoinfre/students/lfleitas/uv_cache
+# export UV_PROJECT_ENVIRONMENT=/sgoinfre/students/lfleitas/call_me_maybe_venv
 
 install:
 	@echo "Installing project dependencies..."
