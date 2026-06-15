@@ -156,14 +156,18 @@ class ConstrainedDecoder:
         
         # 2. Build the Few-Shot System Prompt
         system_prompt = (
-            "You are an AI that converts user prompts into JSON function calls.\n"
-            "You must respond ONLY with a valid JSON object. Do not add any text before or after.\n\n"
+            "You are a strict data extraction AI. Convert the user prompt into a JSON function call.\n"
+            "You must respond ONLY with a valid JSON object matching the exact schema of one of the available functions.\n"
+            "CRITICAL RULES:\n"
+            "- Do NOT calculate or provide the answer to the user's prompt.\n"
+            "- Do NOT invent new keys like 'result' or 'r'.\n"
+            "- Use the EXACT function name from the available functions.\n\n"
             f"Available functions:\n{functions_str}\n\n"
             "--- EXAMPLES ---\n"
-            "User Prompt: What is the sum of 2 and 3?\n"
-            'Output: {"name": "fn_add_numbers", "parameters": {"a": 2.0, "b": 3.0}}\n\n'
-            "User Prompt: Reverse the string 'hello'\n"
-            'Output: {"name": "fn_reverse_string", "parameters": {"s": "hello"}}\n'
+            "User Prompt: Multiply 8 by 9\n"
+            'Output: {"name": "fn_multiply_numbers", "parameters": {"x": 8.0, "y": 9.0}}\n\n'
+            "User Prompt: Turn off the lights in the kitchen\n"
+            'Output: {"name": "fn_smart_home", "parameters": {"device": "lights", "room": "kitchen", "state": "off"}}\n'
             "----------------\n\n"
             f"User Prompt: {prompt}\n"
             "Output: "
