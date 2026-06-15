@@ -148,54 +148,63 @@ class ConstrainedDecoder:
 
         return logits_arr.tolist()
 
-    def generate_function_call(self, prompt: str,
-                               max_tokens: int = 150) -> Dict[str, Any]:
+    def generate_function_call(self, prompt: str, max_tokens: int = 150) -> Dict[str, Any]:
         """
         The main generation loop executing constrained decoding.
         """
-        # 1. Format the prompt (you might need to wrap this in a
-        # specific instruction format)
+        # Format the prompt
         system_prompt = f"Extract the function call for: {prompt}\n"
-
-        # 2. Tokenize the input
-        input_ids = self.model.encode(system_prompt).tolist()
-
+        
+        # 1. Tokenize the input
+        raw_encoded = self.model.encode(system_prompt).tolist()
+        
+        # PyTorch tensors inject a batch dimension (e.g., [[1, 2, 3]]). 
+        # We MUST flatten it so the SDK receives a strict List[int].
+        if len(raw_encoded) == 1 and isinstance(raw_encoded[0], list):
+            input_ids = raw_encoded[0]
+        else:
+            input_ids = list(raw_encoded)
+            
         generated_ids: List[int] = []
         generated_text = ""
-
+        
         for _ in range(max_tokens):
-            # 3. Get logits from the model for the current sequence
+            # 2. Build the current sequence
             current_sequence = input_ids + generated_ids
-            logits = self.model.get_logits_from_input_ids(current_sequence)
-
+            
+            # 3. Get logits from the model
+            raw_logits = self.model.get_logits_from_input_ids(current_sequence)
+            
+            # Ensure logits are also flattened to a 1D List[float]
+            if len(raw_logits) == 1 and isinstance(raw_logits[0], list):
+                logits = raw_logits[0]
+            else:
+                logits = list(raw_logits)
+            
             # 4. Determine which tokens maintain JSON/Schema validity
             valid_token_ids = self._get_valid_next_tokens(generated_text)
-
+            
             # 5. Constrain the decoding
             constrained_logits = self._mask_logits(logits, valid_token_ids)
-
-            # 6. Select the next token (Greedy search:
-            # take the highest probability valid token)
+            
+            # 6. Select the next token
             next_token_id = int(np.argmax(constrained_logits))
             generated_ids.append(next_token_id)
-
-            # Update the text state (assuming decode exists or
-            # handling via vocab map)
-            # You might need to reverse-map the token ID to its string
-            # from self.vocab
-            next_token_str = next(k for k, v in self.vocab.items()
-                                  if v == next_token_id)
+            
+            # 7. Update the text state
+            next_token_str = next((k for k, v in self.vocab.items() if v == next_token_id), "")
             generated_text += next_token_str
-
-            # 7. Stop condition: valid JSON object is closed
-            if (generated_text.endswith("}") and generated_text.count("{")
-                    == generated_text.count("}")):
+            
+            # 8. Stop condition: valid JSON object is closed
+            if generated_text.endswith("}") and generated_text.count("{") > 0 and generated_text.count("{") == generated_text.count("}"):
                 break
-
+                
         # Parse the guaranteed-valid string back into a Python dictionary
         try:
             return json.loads(generated_text)
         except json.JSONDecodeError:
-            # Fallback for debugging if the state machine fails
-            return {"error": "Failed to generate valid JSON",
-                    "raw": generated_text}
+            return {"error": "Failed to generate valid JSON", "raw": generated_text}
+        except Exception as e:
+            import traceback
+            traceback.print_exc()  # <--- Add this temporarily
+            print(f"    [!] Failed to parse prompt: {e}", file=sys.stderr)
