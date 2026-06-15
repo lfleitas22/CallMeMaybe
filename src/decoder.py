@@ -13,7 +13,7 @@ class ConstrainedDecoder:
     def __init__(self, model: Small_LLM_Model, available_functions:
                  List[FunctionDefinition]):
         self.model = model
-        self.available_functions = available_functions
+        self.functions = available_functions
         self.vocab = self._load_vocabulary()
 
     def _load_vocabulary(self) -> Dict[str, int]:
@@ -153,8 +153,7 @@ class ConstrainedDecoder:
         
         # 1. Convert your available functions into a string the LLM can read
         # If you are using Pydantic v2, use .model_dump(). For v1 or standard dicts, use .dict() or asdict.
-        # Assuming self.available_functions is a list of Pydantic objects:
-        functions_str = json.dumps([f.dict() for f in self.available_functions], indent=2)
+        functions_str = json.dumps([f.dict() for f in self.functions], indent=2)
         
         # 2. Build a comprehensive system prompt
         system_prompt = (
