@@ -149,7 +149,22 @@ class ConstrainedDecoder:
         return logits_arr.tolist()
 
     def generate_function_call(self, prompt: str, max_tokens: int = 150, verbose: bool = False) -> Dict[str, Any]:
-        system_prompt = f"Extract the function call for: {prompt}\n"
+        import json # Make sure this is imported at the top of your file
+        
+        # 1. Convert your available functions into a string the LLM can read
+        # If you are using Pydantic v2, use .model_dump(). For v1 or standard dicts, use .dict() or asdict.
+        # Assuming self.available_functions is a list of Pydantic objects:
+        functions_str = json.dumps([f.dict() for f in self.available_functions], indent=2)
+        
+        # 2. Build a comprehensive system prompt
+        system_prompt = (
+            "You are an AI that converts user prompts into JSON function calls.\n"
+            f"Here are the available functions you can use:\n{functions_str}\n\n"
+            f"User Prompt: {prompt}\n"
+            "Generate ONLY a valid JSON object matching the function schema above. Do not output any other text.\n"
+        )
+        
+        # 3. Tokenize the new, rich input
         raw_encoded = self.model.encode(system_prompt).tolist()
         
         if len(raw_encoded) == 1 and isinstance(raw_encoded[0], list):
