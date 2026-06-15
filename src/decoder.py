@@ -148,18 +148,10 @@ class ConstrainedDecoder:
 
         return logits_arr.tolist()
 
-    def generate_function_call(self, prompt: str, max_tokens: int = 150) -> Dict[str, Any]:
-        """
-        The main generation loop executing constrained decoding.
-        """
-        # Format the prompt
+    def generate_function_call(self, prompt: str, max_tokens: int = 150, verbose: bool = False) -> Dict[str, Any]:
         system_prompt = f"Extract the function call for: {prompt}\n"
-        
-        # 1. Tokenize the input
         raw_encoded = self.model.encode(system_prompt).tolist()
         
-        # PyTorch tensors inject a batch dimension (e.g., [[1, 2, 3]]). 
-        # We MUST flatten it so the SDK receives a strict List[int].
         if len(raw_encoded) == 1 and isinstance(raw_encoded[0], list):
             input_ids = raw_encoded[0]
         else:
@@ -168,38 +160,46 @@ class ConstrainedDecoder:
         generated_ids: List[int] = []
         generated_text = ""
         
-        for _ in range(max_tokens):
-            # 2. Build the current sequence
+        if verbose:
+            print(f"\n[Verbose] Starting generation for: '{prompt}'")
+            print(f"[Verbose] Tokens: ", end="", flush=True)
+        
+        for step in range(max_tokens):
             current_sequence = input_ids + generated_ids
-            
-            # 3. Get logits from the model
             raw_logits = self.model.get_logits_from_input_ids(current_sequence)
             
-            # Ensure logits are also flattened to a 1D List[float]
             if len(raw_logits) == 1 and isinstance(raw_logits[0], list):
                 logits = raw_logits[0]
             else:
                 logits = list(raw_logits)
             
-            # 4. Determine which tokens maintain JSON/Schema validity
             valid_token_ids = self._get_valid_next_tokens(generated_text)
             
-            # 5. Constrain the decoding
+            # --- THE SAFETY BRAKE ---
+            if not valid_token_ids:
+                if verbose:
+                    print("\n[!] CRITICAL: State machine found 0 valid tokens. Dead end reached!")
+                break
+            
             constrained_logits = self._mask_logits(logits, valid_token_ids)
             
-            # 6. Select the next token
             next_token_id = int(np.argmax(constrained_logits))
             generated_ids.append(next_token_id)
             
-            # 7. Update the text state
             next_token_str = next((k for k, v in self.vocab.items() if v == next_token_id), "")
             generated_text += next_token_str
             
-            # 8. Stop condition: valid JSON object is closed
+            # --- THE LIVE STREAM ---
+            if verbose:
+                # Replace newlines with \n so it prints cleanly on one line
+                safe_str = next_token_str.replace('\n', '\\n')
+                print(f"'{safe_str}' ", end="", flush=True)
+            
             if generated_text.endswith("}") and generated_text.count("{") > 0 and generated_text.count("{") == generated_text.count("}"):
+                if verbose:
+                    print("\n[Verbose] Valid JSON object successfully closed.")
                 break
                 
-        # Parse the guaranteed-valid string back into a Python dictionary
         try:
             return json.loads(generated_text)
         except json.JSONDecodeError:

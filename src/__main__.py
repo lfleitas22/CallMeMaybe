@@ -86,7 +86,8 @@ def main() -> None:
         print(f" -> Analyzing: '{test_prompt.prompt}'")
         try:
             # Generate the structured dictionary using our state machine
-            call_dict = decoder.generate_function_call(test_prompt.prompt)
+            # Pass the verbose flag from args down to the decoder
+            call_dict = decoder.generate_function_call(test_prompt.prompt, verbose=True)
             results.append(call_dict)
         except Exception as e:
             # Graceful error handling for individual prompt failures
