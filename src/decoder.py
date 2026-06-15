@@ -13,7 +13,7 @@ class ConstrainedDecoder:
     def __init__(self, model: Small_LLM_Model, available_functions:
                  List[FunctionDefinition]):
         self.model = model
-        self.functions = available_functions
+        self.available_functions = available_functions
         self.vocab = self._load_vocabulary()
 
     def _load_vocabulary(self) -> Dict[str, int]:
