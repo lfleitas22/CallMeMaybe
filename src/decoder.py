@@ -149,22 +149,30 @@ class ConstrainedDecoder:
         return logits_arr.tolist()
 
     def generate_function_call(self, prompt: str, max_tokens: int = 150, verbose: bool = False) -> Dict[str, Any]:
-        import json # Make sure this is imported at the top of your file
+        import json
         
-        # 1. Convert your available functions into a string the LLM can read
-        # If you are using Pydantic v2, use .model_dump(). For v1 or standard dicts, use .dict() or asdict.
+        # 1. Convert your available functions into a string
         functions_str = json.dumps([f.dict() for f in self.functions], indent=2)
         
-        # 2. Build a comprehensive system prompt
+        # 2. Build the Few-Shot System Prompt
         system_prompt = (
             "You are an AI that converts user prompts into JSON function calls.\n"
-            f"Here are the available functions you can use:\n{functions_str}\n\n"
+            "You must respond ONLY with a valid JSON object. Do not add any text before or after.\n\n"
+            f"Available functions:\n{functions_str}\n\n"
+            "--- EXAMPLES ---\n"
+            "User Prompt: What is the sum of 2 and 3?\n"
+            'Output: {"name": "fn_add_numbers", "parameters": {"a": 2.0, "b": 3.0}}\n\n'
+            "User Prompt: Reverse the string 'hello'\n"
+            'Output: {"name": "fn_reverse_string", "parameters": {"s": "hello"}}\n'
+            "----------------\n\n"
             f"User Prompt: {prompt}\n"
-            "Generate ONLY a valid JSON object matching the function schema above. Do not output any other text.\n"
+            "Output: "
         )
         
         # 3. Tokenize the new, rich input
         raw_encoded = self.model.encode(system_prompt).tolist()
+        
+        # ... (keep the rest of your generation loop exactly the same) ...
         
         if len(raw_encoded) == 1 and isinstance(raw_encoded[0], list):
             input_ids = raw_encoded[0]
