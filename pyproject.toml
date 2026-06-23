@@ -19,3 +19,12 @@ members = [
 
 [tool.uv.sources]
 llm-sdk = { workspace = true }
+
+[tool.mypy]
+strict = true
+
+[[tool.mypy.overrides]]
+module = "llm_sdk.*"
+ignore_missing_imports = true
+follow_imports = "skip"
+ignore_errors = true

@@ -1,236 +1,593 @@
+"""
+Constrained decoder that enforces JSON structure and function schema
+token by token.
+"""
 import json
-import numpy as np
-from typing import List, Dict, Any
+import re
 from pathlib import Path
+from typing import List, Dict, Any, Optional, ClassVar
 
-# Assuming llm_sdk is in your path/virtual env as per your tree
+
+from pydantic import BaseModel, Field, ConfigDict
+
 from llm_sdk import Small_LLM_Model
 from src.models import FunctionDefinition
-from src.parser import JSONState, IncrementalParser
+from src.parser import IncrementalParser, JSONState
 
 
-class ConstrainedDecoder:
-    def __init__(self, model: Small_LLM_Model, available_functions:
-                 List[FunctionDefinition]):
-        self.model = model
-        self.functions = available_functions
-        self.vocab = self._load_vocabulary()
+class ConstrainedDecoder(BaseModel):
+    """
+    Generates function call JSON using the LLM under strict schema
+    constraints.
+    """
+
+    model_config = ConfigDict(
+        arbitrary_types_allowed=True,
+        populate_by_name=True
+    )
+
+    # Constant without a type hint is ignored by Pydantic validation
+    # (which is what we want)
+    MAX_FRACTIONAL_DIGITS: ClassVar[int] = 10
+
+    # Compile regexes once at the class level
+    FLOAT_PREFIX_PATTERN: ClassVar[re.Pattern[str]] = (
+        re.compile(r'^-?(?:0|[1-9]\d*)(?:\.\d*)?(?:[eE][+-]?\d*)?$')
+    )
+    FLOAT_FINISHED_PATTERN: ClassVar[re.Pattern[str]] = (
+        re.compile(r'^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?$')
+    )
+    INT_PATTERN: ClassVar[re.Pattern[str]] = re.compile(r'^-?(?:0|[1-9]\d*)$')
+
+    NUMBER_SPLIT_PATTERN: ClassVar[re.Pattern[str]] = (
+        re.compile(r'^([-+0-9.eE]+)(.*)$')
+    )
+
+    # 2. Pydantic Fields
+    model: Small_LLM_Model
+    # Alias allows your existing __main__.py to keep using
+    # `available_functions=functions`
+    functions: List[FunctionDefinition] = Field(alias="available_functions")
+    vocab: Dict[str, int] = Field(default_factory=dict)
+    selected_function_name: Optional[str] = None
+    cleaned_vocab: Dict[int, str] = Field(default_factory=dict)
+    static_state_masks: Dict[JSONState, List[int]] = (
+        Field(default_factory=dict))
+    number_candidates: Dict[int, str] = Field(default_factory=dict)
+    boolean_candidates: Dict[int, str] = Field(default_factory=dict)
+    structural_candidates: Dict[int, str] = Field(default_factory=dict)
+
+    # For strings, we separate tokens that contain special JSON characters
+    # from those that are perfectly safe plain text.
+    safe_string_ids: List[int] = Field(default_factory=list)
+    unsafe_string_vocab: Dict[int, str] = Field(default_factory=dict)
+
+    def model_post_init(self, __context: Any) -> None:
+        if not self.vocab:
+            self.vocab = self._load_vocabulary()
+
+        # Pre-clean all tokens exactly once on startup
+        if not self.cleaned_vocab:
+            self.cleaned_vocab = {
+                tok_id: self._clean_token(tok_str)
+                for tok_str, tok_id in self.vocab.items()
+            }
+        if not self.static_state_masks:
+            static_states = [
+                JSONState.EXPECT_OBJECT_START,
+                JSONState.EXPECT_KEY_QUOTE,
+                JSONState.EXPECT_COLON
+            ]
+            for state in static_states:
+                valid_ids = []
+                for tok_id, clean_tok in self.cleaned_vocab.items():
+                    if self._is_token_valid(clean_tok, state, "", "",
+                                            "", False, None):
+                        valid_ids.append(tok_id)
+                self.static_state_masks[state] = valid_ids
+        # 1. Number Candidates: Only tokens strictly containing
+        # numeric/structural characters
+        if not self.number_candidates:
+            allowed_num_chars = set("0123456789.eE+- ,}\n\t\r")
+            self.number_candidates = {
+                tok_id: tok for tok_id, tok in self.cleaned_vocab.items()
+                if set(tok).issubset(allowed_num_chars)
+            }
+
+        # 2. Boolean Candidates: Only tokens containing
+        # boolean/structural characters
+        if not self.boolean_candidates:
+            allowed_bool_chars = set("truefalse ,}\n\t\r")
+            self.boolean_candidates = {
+                tok_id: tok for tok_id, tok in self.cleaned_vocab.items()
+                if set(tok).issubset(allowed_bool_chars)
+            }
+
+        # 3. String Partitioning: Isolate tokens that contain
+        # quotes or backslashes
+        if not self.safe_string_ids and not self.unsafe_string_vocab:
+            for tok_id, tok in self.cleaned_vocab.items():
+                if '"' in tok or '\\' in tok:
+                    self.unsafe_string_vocab[tok_id] = tok
+                else:
+                    self.safe_string_ids.append(tok_id)
+
+        if not self.structural_candidates:
+            self.structural_candidates = {
+                tok_id: tok for tok_id, tok in self.cleaned_vocab.items()
+                if set(tok).issubset(set(",} \n\t\r"))
+            }
 
     def _load_vocabulary(self) -> Dict[str, int]:
-        """
-        Loads the tokenizer vocabulary from the path provided by the SDK.
-        Returns a dictionary mapping token strings to their IDs.
-        """
+        """Load the tokenizer vocabulary from the SDK-provided path."""
         vocab_path = Path(self.model.get_path_to_vocab_file())
         with open(vocab_path, 'r', encoding='utf-8') as f:
-            return json.load(f)
+            data = json.load(f)
+            if not isinstance(data, dict):
+                raise ValueError("Vocabulary file must contain a dict")
+            return {str(k): int(v) for k, v in data.items()}
 
-    def _get_valid_next_tokens(self, generated_text: str) -> List[int]:
-        parser = IncrementalParser()
-        current_state = parser.get_current_state(generated_text)
+    def _clean_token(self, raw_token: str) -> str:
+        """Normalize token by replacing special whitespace characters."""
+        return raw_token.replace("Ġ", " ").replace("Ċ", "\n")
 
-        valid_token_ids = []
-
-        for token_str, token_id in self.vocab.items():
-            # LLM tokenizers often prefix words with special characters
-            # for spaces.
-            # E.g., Qwen might use 'Ġ' or similar. You must normalize
-            # the token string.
-            # Example normalization (adjust based on actual Qwen
-            # vocabulary format):
-            clean_token = token_str.replace("Ġ", " ").replace("Ċ", "\n")
-
-            if self._is_token_valid_for_state(clean_token, current_state,
-                                              parser.current_key,
-                                              generated_text):
-                valid_token_ids.append(token_id)
-
-        return valid_token_ids
-
-    def _is_token_valid_for_state(self, token: str, state: JSONState,
-                                  current_key: str, generated_text:
-                                  str) -> bool:
+    def _is_token_valid(
+        self,
+        clean_token: str,
+        state: JSONState,
+        current_key: str,
+        current_key_partial: str,
+        current_value_partial: str,
+        is_inside_parameters: bool,
+        expected_type: Optional[str] = None,
+        missing_keys: Optional[List[str]] = None,
+    ) -> bool:
         """
-        Determines if a specific token string satisfies the current
-        JSON structural expectation
-        and the schema constraints.
+        Check whether a cleaned token is valid given the current
+        parser state, the partial key/value being built, and the
+        schema constraints.
         """
-        # Empty tokens are usually artifacts, allow them or ignore them based
-        # on tokenizer behavior
-        if not token:
+        if not clean_token:
             return True
 
-        # 1. Structural Validation
+        # 1. Structural states
         if state == JSONState.EXPECT_OBJECT_START:
-            return token.lstrip().startswith('{')
+            return clean_token.lstrip().startswith('{')
 
         elif state == JSONState.EXPECT_KEY_QUOTE:
-            return '"' in token or token.isspace()
+            # Prevent empty parameters dict from appending a comma
+            if ('}' in clean_token and ',' in
+                    clean_token[clean_token.find('}'):]):
+                return False
+            return '"' in clean_token or '}' in clean_token
 
         elif state == JSONState.EXPECT_COLON:
-            return ':' in token or token.isspace()
+            return ':' in clean_token
 
         elif state == JSONState.EXPECT_COMMA_OR_END:
-            return ',' in token or '}' in token or token.isspace()
-
-        # 2. Semantic/Schema Validation
-        elif state == JSONState.IN_NUMBER_VALUE:
-            # Only allow digits, decimals, and structural terminators
-            return all(c.isdigit() or c in '.-eE, }' for c in token)
-
-        elif state == JSONState.IN_KEY:
-            # 1. Gather all legally allowed keys based on our output schema
-            valid_keys = ["prompt", "name", "parameters"]
-
-            # 2. Add all parameter names from all available functions
-            for fn in self.functions:
-                valid_keys.extend(fn.parameters.keys())
-
-            # Remove duplicates to optimize the check
-            valid_keys = list(set(valid_keys))
-
-            # 3. Extract what has already been typed for the current key.
-            # We look for the last quote in the generated text to find
-            # the start of our key.
-            last_quote_idx = generated_text.rfind('"')
-            if last_quote_idx != -1:
-                partial_key = generated_text[last_quote_idx + 1:]
+            if not is_inside_parameters:
+                # Root level boundaries
+                if current_key == "name":
+                    return ',' in clean_token and '}' not in clean_token
+                return '}' in clean_token and ',' not in clean_token
             else:
-                partial_key = ""
+                all_parameters_filled = (missing_keys is not None
+                                         and len(missing_keys) == 0)
 
-            # 4. Combine the prefix with the proposed token.
-            # We use .split('"')[0] to ignore the closing quote if the
-            # token contains one (e.g., 'meters":')
-            proposed_string = partial_key + token.split('"')[0]
+                # Prevent the merged token '},' bypass
+                if ('}' in clean_token and ',' in
+                        clean_token[clean_token.find('}'):]):
+                    return False
 
-            # 5. Check if the resulting string matches or is a prefix
-            # of any allowed key
-            return any(allowed_key.startswith(proposed_string) for
-                       allowed_key in valid_keys)
+                # Schema Enforcement: Force JSON to close if no keys remain
+                if all_parameters_filled:
+                    return '}' in clean_token and ',' not in clean_token
+
+                return ',' in clean_token or '}' in clean_token
+
+        # 2. Schema‑aware states
+        elif state == JSONState.IN_KEY:
+            proposed = current_key_partial + clean_token.split('"')[0]
+            valid_keys: List[str] = []
+            if is_inside_parameters:
+                # Only allow keys that are still missing!
+                if missing_keys is not None:
+                    valid_keys = missing_keys
+            else:
+                valid_keys = ["name", "parameters"]
+            return any(k.startswith(proposed) for k in valid_keys)
 
         elif state == JSONState.IN_STRING_VALUE:
-            # If the current key is "name", force the token to be
-            # a valid function name
-            if current_key == "name":
-                available_names = [f.name for f in self.functions]
-                # Check if the token is part of any available function name
-                return any(fn_name.startswith(token.strip('"')) for fn_name
-                           in available_names)
+            # 1. Enforce strict JSON escape sequences.
+            # Calculate trailing backslashes to see if an escape
+            # sequence is active.
+            bs_count = (len(current_value_partial) -
+                        len(current_value_partial.rstrip('\\')))
+            is_active_escape = (bs_count % 2 == 1)
 
-            # If it's a normal string, allow mostly anything except
-            # unescaped structural quotes
+            if is_active_escape:
+                # In JSON, a backslash MUST be followed by
+                # one of these characters.
+                valid_escapes = ('"', '\\', '/', 'b', 'f', 'n', 'r', 't', 'u')
+                if not clean_token.startswith(valid_escapes):
+                    # This blocks invalid regex tokens like '\s',
+                    # forcing the LLM
+                    # to backtrack and output another '\' to make
+                    # it valid '\\s'.
+                    return False
+
+            # 2. Prevent token-merging deadlocks while enforcing JSON schema.
+            if '"' in clean_token:
+                if clean_token == '"':
+                    return True
+
+                # If the tokenizer merges the quote (e.g. 's"'),
+                # simulate the addition.
+                combined = current_value_partial + clean_token
+
+                # Find the first unescaped quote in the newly combined string
+                for i in range(len(current_value_partial), len(combined)):
+                    if combined[i] == '"':
+                        # Count backslashes before this specific quote
+                        b_count = 0
+                        curr = i - 1
+                        while curr >= 0 and combined[curr] == '\\':
+                            b_count += 1
+                            curr -= 1
+
+                        if b_count % 2 == 0:
+                            # The string has formally closed.
+                            rest = combined[i + 1:]
+                            if not all(c in ' \n\t\r,}' for c in rest):
+                                return False
+
+                            # --- MERGED TOKEN & SCHEMA COMPLETION ENFORCEMENT
+                            if is_inside_parameters:
+                                all_parameters_filled = (
+                                    missing_keys is not None
+                                    and len(missing_keys) == 0)
+
+                                if ('}' in rest and ','
+                                        in rest[rest.find('}'):]):
+                                    return False
+
+                                # Prevent comma if all schema keys are okey
+                                if all_parameters_filled and ',' in rest:
+                                    return False
+                            # ----------------------------------------------------
+
+                            return True
+
+                # All quotes in this token were escaped, so it's valid
+                # internal string content.
+                return True
+
+            # --- NEW: PREVENT FUNCTION NAME HALLUCINATION ---
+            if not is_inside_parameters and current_key == "name":
+                proposed = current_value_partial + clean_token.replace('"', '')
+                valid_names = [f.name for f in self.functions]
+                # If the proposed string isn't spelling a valid function name,
+                # kill the token probability
+                if not any(name.startswith(proposed) for name in valid_names):
+                    return False
+            # ------------------------------------------------
+
             return True
 
+        elif state == JSONState.IN_NUMBER_VALUE:
+            combined = current_value_partial + clean_token
+            is_integer = (expected_type == "integer")
+
+            # Use compiled split pattern
+            match = self.NUMBER_SPLIT_PATTERN.match(combined)
+            if not match:
+                return False
+
+            num_part, rest = match.groups()
+
+            if not rest:
+                if is_integer:
+                    if '.' in clean_token or 'e' in clean_token.lower():
+                        return False
+                    # Use compiled int pattern
+                    if not self.INT_PATTERN.match(num_part):
+                        return False
+                else:
+                    # Use compiled float prefix pattern
+                    if not self.FLOAT_PREFIX_PATTERN.match(num_part):
+                        return False
+                # ... [fractional digits check remains the same] ...
+                return True
+            else:
+                if is_integer:
+                    # Use compiled int pattern
+                    if not self.INT_PATTERN.match(num_part):
+                        return False
+                else:
+                    # Use compiled float finished pattern
+                    if not self.FLOAT_FINISHED_PATTERN.match(num_part):
+                        return False
+
+                if rest[0] not in (',', '}', ' ', '\n', '\t'):
+                    return False
+
+                # --- MERGED TOKEN & SCHEMA COMPLETION ENFORCEMENT ---
+                if is_inside_parameters:
+                    all_parameters_filled = (missing_keys is not None
+                                             and len(missing_keys) == 0)
+
+                    if '}' in rest and ',' in rest[rest.find('}'):]:
+                        return False
+
+                    # Prevent comma if all schema keys are satisfied
+                    if all_parameters_filled and ',' in rest:
+                        return False
+                # ----------------------------------------------------
+
+                return True
+
+        elif state == JSONState.IN_BOOLEAN_VALUE:
+            combined = current_value_partial + clean_token
+            return "true".startswith(combined) or "false".startswith(combined)
+
         elif state == JSONState.EXPECT_VALUE:
-            # If we expect a value, ensure the token starts with the correct
-            # type based on the schema
-            # E.g., if current_key == "name", it must start with '"'
-            return True  # Implement strict type enforcement here
+            # Lookups are removed. We just use the passed expected_type.
+            if expected_type == "number" or expected_type == "integer":
+                stripped = clean_token.lstrip()
+                return bool(stripped) and (
+                    stripped[0].isdigit() or stripped[0] == '-'
+                )
+            elif expected_type == "boolean":
+                stripped = clean_token.lstrip()
+                return stripped.startswith(('t', 'f'))
+            elif expected_type == "string":
+                return '"' in clean_token
+            elif current_key == "name":
+                return '"' in clean_token
+            return True
 
         return False
 
-    def _mask_logits(self, logits: List[float],
-                     valid_token_ids: List[int]) -> List[float]:
+    def _get_best_valid_token(
+        self, logits: List[float], valid_ids: List[int]
+    ) -> int:
         """
-        Sets the probability of all invalid tokens to negative infinity.
+        Finds the ID of the highest probability valid token in O(K) time,
+        completely bypassing heavy numpy array allocations and masking.
         """
-        # Convert to numpy array for fast manipulation
-        logits_arr = np.array(logits, dtype=np.float32)
+        best_id = valid_ids[0]
+        best_logit = logits[best_id]
 
-        # Create a boolean mask of the same size, default to False
-        mask = np.zeros_like(logits_arr, dtype=bool)
+        for vid in valid_ids[1:]:
+            if logits[vid] > best_logit:
+                best_logit = logits[vid]
+                best_id = vid
 
-        # Set True only for valid token indices
-        mask[valid_token_ids] = True
+        return best_id
 
-        # Apply constraint: if not in mask, set to -inf
-        logits_arr[~mask] = -np.inf
+    def generate_function_call(
+        self, prompt: str, max_tokens: int = 256, verbose: bool = False
+    ) -> Dict[str, Any]:
+        """
+        Generate a function call JSON for the given natural language
+        prompt. Returns a dict with keys 'name' and 'parameters'.
+        """
+        self.selected_function_name = None
 
-        return logits_arr.tolist()
-
-    def generate_function_call(self, prompt: str, max_tokens: int = 150, verbose: bool = False) -> Dict[str, Any]:
-        import json
-        
-        # 1. Convert your available functions into a string
-        functions_str = json.dumps([f.dict() for f in self.functions], indent=2)
-        
-        # 2. Build the Few-Shot System Prompt
-        system_prompt = (
-            "You are a strict data extraction AI. Convert the user prompt into a JSON function call.\n"
-            "You must respond ONLY with a valid JSON object matching the exact schema of one of the available functions.\n"
-            "CRITICAL RULES:\n"
-            "- Do NOT calculate or provide the answer to the user's prompt.\n"
-            "- Do NOT invent new keys like 'result' or 'r'.\n"
-            "- Use the EXACT function name from the available functions.\n\n"
-            f"Available functions:\n{functions_str}\n\n"
-            "--- EXAMPLES ---\n"
-            "User Prompt: Multiply 8 by 9\n"
-            'Output: {"name": "fn_multiply_numbers", "parameters": {"x": 8.0, "y": 9.0}}\n\n'
-            "User Prompt: Turn off the lights in the kitchen\n"
-            'Output: {"name": "fn_smart_home", "parameters": {"device": "lights", "room": "kitchen", "state": "off"}}\n'
-            "----------------\n\n"
-            f"User Prompt: {prompt}\n"
-            "Output: "
+        # Build a system prompt that lists available functions
+        functions_str = json.dumps(
+            [f.model_dump() for f in self.functions],
+            separators=(',', ':')
         )
-        
-        # 3. Tokenize the new, rich input
+
+        # 2. Use ChatML formatting to trigger the model's
+        # instruction-following weights
+        system_prompt = (
+            f"<|im_start|>system\n"
+            f"Select the correct function and extract parameters as JSON.\n"
+            f"Functions:{functions_str}<|im_end|>\n"
+            f"<|im_start|>user\n"
+            f"{prompt}<|im_end|>\n"
+            f"<|im_start|>assistant\n"
+        )
+
+        # Tokenize the full prompt
         raw_encoded = self.model.encode(system_prompt).tolist()
-        
-        # ... (keep the rest of your generation loop exactly the same) ...
-        
-        if len(raw_encoded) == 1 and isinstance(raw_encoded[0], list):
+        if isinstance(raw_encoded[0], list):
             input_ids = raw_encoded[0]
         else:
             input_ids = list(raw_encoded)
-            
-        generated_ids: List[int] = []
-        generated_text = ""
-        
+
+        # Force the JSON opening: {"name": "
+        forced_prefix = '{"name": "'
+        prefix_raw = self.model.encode(forced_prefix).tolist()
+        if isinstance(prefix_raw[0], list):
+            prefix_ids = prefix_raw[0]
+        else:
+            prefix_ids = list(prefix_raw)
+
+        generated_ids: List[int] = list(prefix_ids)
+        clean_text = forced_prefix
+        parser = IncrementalParser()
+
         if verbose:
-            print(f"\n[Verbose] Starting generation for: '{prompt}'")
-            print(f"[Verbose] Tokens: ", end="", flush=True)
-        
-        for step in range(max_tokens):
-            current_sequence = input_ids + generated_ids
-            raw_logits = self.model.get_logits_from_input_ids(current_sequence)
-            
-            if len(raw_logits) == 1 and isinstance(raw_logits[0], list):
+            print(f"\n[Verbose] Prompt: {prompt}")
+            print(f"[Verbose] Prefix: {forced_prefix}")
+
+        cached_expected_type: Optional[str] = None
+
+        for _ in range(max_tokens):
+            # 1. Forward pass
+            sequence = input_ids + generated_ids
+            raw_logits = self.model.get_logits_from_input_ids(sequence)
+            if isinstance(raw_logits[0], list):
                 logits = raw_logits[0]
             else:
                 logits = list(raw_logits)
-            
-            valid_token_ids = self._get_valid_next_tokens(generated_text)
-            
-            # --- THE SAFETY BRAKE ---
-            if not valid_token_ids:
+
+            # 2. Current parser state and context
+            state = parser.get_current_state(clean_text)
+
+            # Update selected function name once "name" value is completed
+            if (
+                self.selected_function_name is None
+                and parser.top_level_key_values
+                and "name" in parser.top_level_key_values
+            ):
+                self.selected_function_name = (
+                    parser.top_level_key_values["name"]
+                )
+
+            current_key = parser.current_key
+            current_key_partial = parser.current_key_partial
+            current_value_partial = parser.current_value_content
+            is_inside_params = (
+                len(parser.context_keys) > 0
+                and parser.context_keys[-1] == "parameters"
+            )
+
+            # --- NEW CACHING LOGIC ---
+            # Only perform the schema lookup if we are inside parameters and
+            # the key has changed
+            missing_keys: Optional[List[str]] = None
+            if is_inside_params and self.selected_function_name:
+                fn_def = next((f for f in self.functions
+                               if f.name == self.selected_function_name), None)
+                if fn_def:
+                    expected_keys = list(fn_def.parameters.keys())
+
+                    compressed_text = clean_text.replace(" ",
+                                                         "").replace("\n", "")
+                    params_marker = '"parameters":{'
+
+                    if params_marker in compressed_text:
+                        # ISOLATION: Only search for keys AFTER the
+                        # parameters dictionary opens
+                        params_body = (compressed_text.split(params_marker,
+                                                             1)[1])
+                        found_keys = set()
+                        for k in expected_keys:
+                            if f'"{k}":' in params_body:
+                                found_keys.add(k)
+
+                        # Always include the key currently being typed
+                        if current_key in expected_keys:
+                            found_keys.add(current_key)
+
+                        missing_keys = ([k for k in expected_keys
+                                         if k not in found_keys])
+                    else:
+                        missing_keys = expected_keys
+            # -------------------------
+
+            # 3. Gather valid next tokens
+            if state in self.static_state_masks:
+                # Instantly retrieve valid tokens, bypassing 150,000 checks
+                valid_ids = self.static_state_masks[state]
+
+            elif (state == JSONState.EXPECT_COMMA_OR_END
+                  and not is_inside_params):
+                # THE RAILROAD: Absolute root-level strictness
+                # using text look-behind
+                valid_ids = []
+                is_after_params = clean_text.rstrip().endswith('}')
+
+                for tid, tok in self.structural_candidates.items():
+                    if is_after_params:
+                        # Parameters dict closed -> Force root object to close
+                        # Require a '}' and strictly forbid ','
+                        if '}' in tok and ',' not in tok:
+                            valid_ids.append(tid)
+                    else:
+                        # Name string closed -> Force comma to prepare
+                        # for parameters key
+                        # Require a ',' and strictly forbid '}'
+                        if ',' in tok and '}' not in tok:
+                            valid_ids.append(tid)
+            else:
+                valid_ids = []
+
+                # --- ROUTING LOGIC ---
+                search_space = self.cleaned_vocab  # Default fallback
+
+                if state == JSONState.EXPECT_COMMA_OR_END:
+                    search_space = self.structural_candidates
+
+                elif (state == JSONState.IN_NUMBER_VALUE or
+                        (state == JSONState.EXPECT_VALUE and
+                         cached_expected_type in ("number", "integer"))):
+                    search_space = self.number_candidates
+
+                elif (state == JSONState.IN_BOOLEAN_VALUE or
+                        (state == JSONState.EXPECT_VALUE and
+                         cached_expected_type == "boolean")):
+                    search_space = self.boolean_candidates
+
+                elif state == JSONState.IN_STRING_VALUE:
+                    # If we are in a string and not processing an active
+                    # escape sequence (\),
+                    # all safe tokens are instantly valid without any regex
+                    # evaluation.
+                    bs_count = (len(current_value_partial) -
+                                len(current_value_partial.rstrip('\\')))
+                    if bs_count % 2 == 0:
+                        valid_ids.extend(self.safe_string_ids)
+                        search_space = self.unsafe_string_vocab
+                # -------------------------
+
+                # Only iterate over the aggressively pruned search space
+                for token_id, clean_tok in search_space.items():
+                    if self._is_token_valid(
+                        clean_tok,
+                        state,
+                        current_key,
+                        current_key_partial,
+                        current_value_partial,
+                        is_inside_params,
+                        cached_expected_type,
+                        missing_keys,  # <-- ADD THIS ARGUMENT
+                    ):
+                        valid_ids.append(token_id)
+
+            if not valid_ids:
                 if verbose:
-                    print("\n[!] CRITICAL: State machine found 0 valid tokens. Dead end reached!")
+                    print("\n[!] No valid tokens available. Breaking.")
                 break
-            
-            constrained_logits = self._mask_logits(logits, valid_token_ids)
-            
-            next_token_id = int(np.argmax(constrained_logits))
+
+            # 4. Apply mask and select next token (greedy)
+            next_token_id = self._get_best_valid_token(logits, valid_ids)
             generated_ids.append(next_token_id)
-            
-            next_token_str = next((k for k, v in self.vocab.items() if v == next_token_id), "")
-            generated_text += next_token_str
-            
-            # --- THE LIVE STREAM ---
+
+            # 5. Update the cleaned text
+            raw_token = next(
+                (k for k, v in self.vocab.items() if v == next_token_id), ""
+            )
+            clean_tok = self._clean_token(raw_token)
+            clean_text += clean_tok
+
             if verbose:
-                # Replace newlines with \n so it prints cleanly on one line
-                safe_str = next_token_str.replace('\n', '\\n')
-                print(f"'{safe_str}' ", end="", flush=True)
-            
-            if generated_text.endswith("}") and generated_text.count("{") > 0 and generated_text.count("{") == generated_text.count("}"):
+                safe = clean_tok.replace('\n', '\\n')
+                print(f"'{safe}' ", end="", flush=True)
+
+            # 6. Stop when a complete JSON object is formed
+            if (
+                clean_text.strip().endswith("}")
+                and clean_text.count("{") == clean_text.count("}")
+            ):
                 if verbose:
-                    print("\n[Verbose] Valid JSON object successfully closed.")
+                    print("\n[Verbose] JSON object completed.")
                 break
-                
+
+        if verbose:
+            print()
+
         try:
-            return json.loads(generated_text)
-        except json.JSONDecodeError:
-            return {"error": "Failed to generate valid JSON", "raw": generated_text}
-        except Exception as e:
-            import traceback
-            traceback.print_exc()  # <--- Add this temporarily
-            print(f"    [!] Failed to parse prompt: {e}", file=sys.stderr)
+            result = json.loads(clean_text)
+            if not isinstance(result, dict) or "name" not in result:
+                raise ValueError("Generated JSON missing 'name' key")
+            return {
+                "name": result["name"],
+                "parameters": result.get("parameters", {})
+            }
+        except (json.JSONDecodeError, ValueError) as e:
+            return {"name": "", "parameters": {}, "error": str(e)}

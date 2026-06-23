@@ -1,9 +1,12 @@
+"""
+Pydantic models for function definitions, test prompts, and output results.
+"""
 from pydantic import BaseModel, Field
-from typing import Dict, Any, Optional
+from typing import Dict, Optional
 
 
 class ParameterDef(BaseModel):
-    """Definition of a single parameter within a function."""
+    """Definition of a single function parameter."""
     type: str
 
 
@@ -13,8 +16,7 @@ class ReturnDef(BaseModel):
 
 
 class FunctionDefinition(BaseModel):
-    """Represents a single available function from functions_definition.json.
-    """
+    """A function available for calling."""
     name: str
     description: str
     parameters: Dict[str, ParameterDef] = Field(default_factory=dict)
@@ -22,12 +24,5 @@ class FunctionDefinition(BaseModel):
 
 
 class TestPrompt(BaseModel):
-    """Represents an incoming prompt from function_calling_tests.json."""
+    """A natural language prompt to be converted into a function call."""
     prompt: str
-
-
-class FunctionCallResult(BaseModel):
-    """The required output structure for function_calling_results.json."""
-    prompt: str
-    name: str
-    parameters: Dict[str, Any]
