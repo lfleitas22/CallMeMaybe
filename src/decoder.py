@@ -56,7 +56,9 @@ class ConstrainedDecoder(BaseModel):
     number_candidates: Dict[int, str] = Field(default_factory=dict)
     boolean_candidates: Dict[int, str] = Field(default_factory=dict)
     structural_candidates: Dict[int, str] = Field(default_factory=dict)
-
+    key_content_candidates: Dict[int, str] = Field(default_factory=dict)
+    string_start_candidates: Dict[int, str] = Field(default_factory=dict)
+    exact_syntax_ids: Dict[str, int] = Field(default_factory=dict)
     # For strings, we separate tokens that contain special JSON characters
     # from those that are perfectly safe plain text.
     safe_string_ids: List[int] = Field(default_factory=list)
@@ -117,6 +119,31 @@ class ConstrainedDecoder(BaseModel):
                 tok_id: tok for tok_id, tok in self.cleaned_vocab.items()
                 if set(tok).issubset(set(",} \n\t\r"))
             }
+        # 4. Key Candidates: Only tokens containing letters,
+        # underscores, and quotes
+        if not self.key_content_candidates:
+            # Dynamically gather all possible characters used in
+            # your schema keys
+            valid_key_chars = set('nameparameters_"')
+            for f in self.functions:
+                for k in f.parameters.keys():
+                    valid_key_chars.update(k)
+
+            self.key_content_candidates = {
+                tok_id: tok for tok_id, tok in self.cleaned_vocab.items()
+                if set(tok).issubset(valid_key_chars)
+            }
+
+        # 5. String Start Candidates: Tokens containing a quote
+        if not self.string_start_candidates:
+            self.string_start_candidates = {
+                tok_id: tok for tok_id, tok in self.cleaned_vocab.items()
+                if '"' in tok
+            }
+        if not self.exact_syntax_ids:
+            for tid, t in self.cleaned_vocab.items():
+                if t in (":", "{", "}", ","):
+                    self.exact_syntax_ids[t] = tid
 
     def _load_vocabulary(self) -> Dict[str, int]:
         """Load the tokenizer vocabulary from the SDK-provided path."""
@@ -415,17 +442,9 @@ class ConstrainedDecoder(BaseModel):
             print(f"[Verbose] Prefix: {forced_prefix}")
 
         cached_expected_type: Optional[str] = None
-
+        current_fn_def = None
         for _ in range(max_tokens):
-            # 1. Forward pass
-            sequence = input_ids + generated_ids
-            raw_logits = self.model.get_logits_from_input_ids(sequence)
-            if isinstance(raw_logits[0], list):
-                logits = raw_logits[0]
-            else:
-                logits = list(raw_logits)
-
-            # 2. Current parser state and context
+            # 1. Current parser state and context
             state = parser.get_current_state(clean_text)
 
             # Update selected function name once "name" value is completed
@@ -437,6 +456,10 @@ class ConstrainedDecoder(BaseModel):
                 self.selected_function_name = (
                     parser.top_level_key_values["name"]
                 )
+                # 2. CACHE THE FUNCTION DEFINITION HERE (Runs only once!)
+                current_fn_def = next((f for f in self.functions
+                                       if f.name ==
+                                       self.selected_function_name), None)
 
             current_key = parser.current_key
             current_key_partial = parser.current_key_partial
@@ -445,39 +468,54 @@ class ConstrainedDecoder(BaseModel):
                 len(parser.context_keys) > 0
                 and parser.context_keys[-1] == "parameters"
             )
+            # 3. --- FIX THE DEAD VARIABLE ---
+            # Update the expected type so the routing logic actually works
+            if current_key == "name":
+                cached_expected_type = "string"
+            elif is_inside_params and current_fn_def is not None:
+                # Mypy now knows current_fn_def is 100% safe to use
+                if current_key in current_fn_def.parameters:
+                    cached_expected_type = (
+                        current_fn_def.parameters[current_key].type)
+                else:
+                    cached_expected_type = None
+            else:
+                cached_expected_type = None
 
-            # --- NEW CACHING LOGIC ---
-            # Only perform the schema lookup if we are inside parameters and
-            # the key has changed
+            # 4. Use the cached current_fn_def instead of searching
+            # for it again
             missing_keys: Optional[List[str]] = None
-            if is_inside_params and self.selected_function_name:
-                fn_def = next((f for f in self.functions
-                               if f.name == self.selected_function_name), None)
-                if fn_def:
-                    expected_keys = list(fn_def.parameters.keys())
+            if (
+                is_inside_params
+                and current_fn_def is not None
+                and state in (JSONState.EXPECT_KEY_QUOTE,
+                              JSONState.EXPECT_COMMA_OR_END,
+                              JSONState.IN_KEY)
+            ):
+                expected_keys = list(current_fn_def.parameters.keys())
 
-                    compressed_text = clean_text.replace(" ",
-                                                         "").replace("\n", "")
-                    params_marker = '"parameters":{'
+                compressed_text = clean_text.replace(" ",
+                                                     "").replace("\n", "")
+                params_marker = '"parameters":{'
 
-                    if params_marker in compressed_text:
-                        # ISOLATION: Only search for keys AFTER the
-                        # parameters dictionary opens
-                        params_body = (compressed_text.split(params_marker,
-                                                             1)[1])
-                        found_keys = set()
-                        for k in expected_keys:
-                            if f'"{k}":' in params_body:
-                                found_keys.add(k)
+                if params_marker in compressed_text:
+                    # ISOLATION: Only search for keys AFTER the
+                    # parameters dictionary opens
+                    params_body = (compressed_text.split(params_marker,
+                                                         1)[1])
+                    found_keys = set()
+                    for k in expected_keys:
+                        if f'"{k}":' in params_body:
+                            found_keys.add(k)
 
-                        # Always include the key currently being typed
-                        if current_key in expected_keys:
-                            found_keys.add(current_key)
+                    # Always include the key currently being typed
+                    if current_key in expected_keys:
+                        found_keys.add(current_key)
 
-                        missing_keys = ([k for k in expected_keys
-                                         if k not in found_keys])
-                    else:
-                        missing_keys = expected_keys
+                    missing_keys = ([k for k in expected_keys
+                                     if k not in found_keys])
+                else:
+                    missing_keys = expected_keys
             # -------------------------
 
             # 3. Gather valid next tokens
@@ -534,7 +572,13 @@ class ConstrainedDecoder(BaseModel):
                         valid_ids.extend(self.safe_string_ids)
                         search_space = self.unsafe_string_vocab
                 # -------------------------
+                elif state == JSONState.IN_KEY:
+                    search_space = self.key_content_candidates
 
+                elif state == JSONState.EXPECT_VALUE and (
+                        cached_expected_type == "string"
+                        or current_key == "name"):
+                    search_space = self.string_start_candidates
                 # Only iterate over the aggressively pruned search space
                 for token_id, clean_tok in search_space.items():
                     if self._is_token_valid(
@@ -548,21 +592,57 @@ class ConstrainedDecoder(BaseModel):
                         missing_keys,  # <-- ADD THIS ARGUMENT
                     ):
                         valid_ids.append(token_id)
-
+            if valid_ids:
+                if state == JSONState.EXPECT_COLON:
+                    valid_ids = [self.exact_syntax_ids[":"]]
+                elif state == JSONState.EXPECT_OBJECT_START:
+                    valid_ids = [self.exact_syntax_ids["{"]]
+                elif state == JSONState.EXPECT_COMMA_OR_END:
+                    if (is_inside_params and missing_keys is not
+                            None and len(missing_keys) == 0):
+                        valid_ids = [self.exact_syntax_ids["}"]]
+                    elif (not is_inside_params and
+                          clean_text.rstrip().endswith('}')):
+                        valid_ids = [self.exact_syntax_ids["}"]]
+                    elif not is_inside_params:
+                        valid_ids = [self.exact_syntax_ids[","]]
+                elif state == JSONState.EXPECT_KEY_QUOTE:
+                    if (is_inside_params and missing_keys is not
+                            None and len(missing_keys) == 0):
+                        valid_ids = [self.exact_syntax_ids["}"]]
             if not valid_ids:
                 if verbose:
                     print("\n[!] No valid tokens available. Breaking.")
                 break
 
-            # 4. Apply mask and select next token (greedy)
-            next_token_id = self._get_best_valid_token(logits, valid_ids)
+            # --- OPTIMIZATION 1: FAST-FORWARD ---
+            if len(valid_ids) == 1:
+                # Skip the LLM entirely if the schema strictly
+                # forces this token
+                next_token_id = valid_ids[0]
+            else:
+                # --- OPTIMIZATION 2: CONTEXT TRUNCATION ---
+                sequence = input_ids + generated_ids
+                # Truncate to the last 512 tokens to prevent the
+                # model from slowing down
+                truncated_sequence = sequence[-512:]
+
+                # 4. Forward pass (Only called when the LLM actually
+                # needs to make a choice)
+                raw_logits = (
+                    self.model.get_logits_from_input_ids(truncated_sequence))
+                if isinstance(raw_logits[0], list):
+                    logits = raw_logits[0]
+                else:
+                    logits = list(raw_logits)
+
+                # Apply mask and select next token (greedy)
+                next_token_id = self._get_best_valid_token(logits, valid_ids)
             generated_ids.append(next_token_id)
 
             # 5. Update the cleaned text
-            raw_token = next(
-                (k for k, v in self.vocab.items() if v == next_token_id), ""
-            )
-            clean_tok = self._clean_token(raw_token)
+            # Instantly fetch the pre-cleaned token in O(1) time
+            clean_tok = self.cleaned_vocab.get(next_token_id, "")
             clean_text += clean_tok
 
             if verbose:
@@ -589,5 +669,5 @@ class ConstrainedDecoder(BaseModel):
                 "name": result["name"],
                 "parameters": result.get("parameters", {})
             }
-        except (json.JSONDecodeError, ValueError) as e:
-            return {"name": "", "parameters": {}, "error": str(e)}
+        except (json.JSONDecodeError, ValueError):
+            return {"name": "", "parameters": {}}

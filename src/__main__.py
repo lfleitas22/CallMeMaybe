@@ -5,6 +5,7 @@ Usage: uv run python -m src [--functions_definition ...]
 """
 import argparse
 import sys
+import os
 from typing import List, Dict, Any
 
 from pydantic import ValidationError
@@ -62,6 +63,23 @@ def build_result(prompt: str, call_dict: Dict[str, Any]) -> Dict[str, Any]:
 def main() -> None:
     """Main execution flow."""
     args = parse_args()
+    if not args.functions_definition or not os.path.isfile(
+            args.functions_definition):
+        print(f"[!] Error: The functions definition file could not "
+              f"be found or is invalid: '{args.functions_definition}'",
+              file=sys.stderr)
+        sys.exit(1)
+
+    # Check input prompts file
+    if not args.input or not os.path.isfile(args.input):
+        print(f"[!] Error: The input prompts file could not be found "
+              f"or is invalid: '{args.input}'", file=sys.stderr)
+        sys.exit(1)
+
+    if not args.output or os.path.isdir(args.output):
+        print(f"[!] Error: The output path is invalid or is a "
+              f"directory: '{args.output}'", file=sys.stderr)
+        sys.exit(1)
 
     print(f"Loading function definitions from: {args.functions_definition}")
     print(f"Loading prompts from: {args.input}")
@@ -103,25 +121,22 @@ def main() -> None:
     for test_prompt in prompts:
         print(f" -> Analyzing: '{test_prompt.prompt}'")
         try:
+            # Verbose show the token process
             call_dict = decoder.generate_function_call(
                 test_prompt.prompt, verbose=True
             )
             results.append(build_result(test_prompt.prompt, call_dict))
         except Exception as e:
-            """ THIS
-                MUST
-                BE
-                CHANGED
-                BECAUSE
-                ITS
-                WRONG
-            """
-            print(f"    [!] Failed to parse prompt: {e}", file=sys.stderr)
-            # Insert a safe fallback entry
+            # 1. Provide a clear, traceable error message to
+            # the user without crashing
+            print(f"    [!] Error processing prompt '{test_prompt.prompt}': "
+                  f"{e}", file=sys.stderr)
+            # 2. Insert a safe fallback entry that does not
+            # invent fake schema keys
             results.append({
                 "prompt": test_prompt.prompt,
-                "name": "error",
-                "parameters": {"details": str(e)},
+                "name": "",
+                "parameters": {}
             })
 
     print(f"Writing results to: {args.output}")
@@ -130,4 +145,9 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n\n[!] Execution interrupted by user. "
+              "Exiting gracefully...", file=sys.stderr)
+        sys.exit(130)
